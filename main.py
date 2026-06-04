@@ -112,15 +112,21 @@ if __name__ == '__main__':
 
             print("Performing initial imputation with dedicated MissForest...")
             
-            # 1. Copy the data and cast it to float64 to prevent the strict type check error
-            X_nan = X.numpy().copy().astype(np.float64) 
+            # 1. Create a copy of the standardized data and cast it to float64
+            X_nan = X.numpy().copy().astype(np.float64)
             
             # 2. Insert NaNs where values are missing
             X_nan[mask_train.numpy()] = np.nan
             
-            # 3. Initialize and fit MissForest
+            # 3. Convert the NumPy array to a pandas DataFrame (required by MissForest)
+            X_df = pd.DataFrame(X_nan)
+            
+            # 4. Initialize and fit MissForest
             imputer = MissForest()
-            train_data = imputer.fit_transform(X_nan)
+            train_data_df = imputer.fit_transform(X_df)
+            
+            # 5. Convert the completed DataFrame back to a NumPy array for the downstream model
+            train_data = train_data_df.to_numpy()
 
             # X_miss = (1. - mask_train.float()) * X
             # train_data = X_miss.numpy()
