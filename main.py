@@ -1,4 +1,4 @@
-!pip install missforest
+pip install missforest
 
 import os
 import torch
