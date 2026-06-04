@@ -1,8 +1,12 @@
+!pip install missforest
+
 import os
 import torch
 import torch_xla
 import torch_xla.core.xla_model as xm
 import numpy as np
+import numpy as np
+from missforest import MissForest
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import argparse
@@ -84,8 +88,17 @@ if __name__ == '__main__':
         print(ckpt_dir)
 
         if iteration == 0:
-            X_miss = (1. - mask_train.float()) * X
-            train_data = X_miss.numpy()
+            print("Performing initial imputation with dedicated MissForest...")
+            
+            # 1. Create a copy of the standardized data
+            X_nan = X.numpy().copy()
+            
+            # 2. Insert NaNs where values are missing
+            X_nan[mask_train.numpy()] = np.nan
+            
+            # 3. Initialize and fit MissForest
+            imputer = MissForest()
+            train_data = imputer.fit_transform(X_nan)
         else:
             print(f'Loading X_miss from {ckpt_dir}/iter_{iteration}.npy')
             X_miss = np.load(f'{ckpt_dir}/iter_{iteration}.npy') / 2
