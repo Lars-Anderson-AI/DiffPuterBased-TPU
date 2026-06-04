@@ -109,10 +109,11 @@ if __name__ == '__main__':
         print(ckpt_dir)
 
         if iteration == 0:
+
             print("Performing initial imputation with dedicated MissForest...")
             
-            # 1. Create a copy of the standardized data
-            X_nan = X.numpy().copy()
+            # 1. Copy the data and cast it to float64 to prevent the strict type check error
+            X_nan = X.numpy().copy().astype(np.float64) 
             
             # 2. Insert NaNs where values are missing
             X_nan[mask_train.numpy()] = np.nan
