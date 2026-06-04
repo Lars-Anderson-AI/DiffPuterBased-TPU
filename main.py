@@ -1,13 +1,10 @@
-
 import os
 import torch
-import torch_xla
-import torch_xla.core.xla_model as xm
+
 import numpy as np
-import numpy as np
-from missforest import MissForest
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from missforest import MissForest
 import argparse
 import warnings
 import time
@@ -17,6 +14,30 @@ from model import MLPDiffusion, Model
 from dataset import load_dataset, get_eval, mean_std
 from diffusion_utils import sample_step, impute_mask
 
+# =====================================================================
+# TAMBAHAN UNTUK MULTI-GPU: Membantu DataParallel memproses nilai skalar
+# =====================================================================
+class DPWrapper(torch.nn.DataParallel):
+    def forward(self, x, sigma, *args, **kwargs):
+        # Jika sigma adalah nilai tunggal (skalar), perbanyak sebanyak jumlah batch
+        if isinstance(sigma, torch.Tensor):
+            if sigma.dim() == 0:
+                sigma = sigma.unsqueeze(0).expand(x.shape[0])
+            elif sigma.numel() == 1:
+                sigma = sigma.view(1).expand(x.shape[0])
+        return super().forward(x, sigma, *args, **kwargs)
+    @property
+    def sigma_min(self):
+        return self.module.sigma_min
+
+    @property
+    def sigma_max(self):
+        return self.module.sigma_max
+
+    def round_sigma(self, sigma):
+        return self.module.round_sigma(sigma)
+# =====================================================================
+
 warnings.filterwarnings('ignore')
 
 parser = argparse.ArgumentParser(description='Missing Value Imputation')
@@ -24,7 +45,7 @@ parser = argparse.ArgumentParser(description='Missing Value Imputation')
 parser.add_argument('--dataname', type=str, default='adult', help='Name of dataset.')
 parser.add_argument('--gpu', type=int, default=0, help='GPU index.')
 parser.add_argument('--split_idx', type=int, default=0, help='Split idx.')
-parser.add_argument('--max_iter', type=int, default=10, help='Maximum iteration.')
+parser.add_argument('--max_iter', type=int, default=2, help='Maximum iteration.')
 parser.add_argument('--ratio', type=str, default=30, help='Masking ratio.')
 parser.add_argument('--hid_dim', type=int, default=1024, help='Hidden dimension.')
 parser.add_argument('--mask', type=str, default='MCAR', help='Masking machenisms.')
@@ -33,19 +54,20 @@ parser.add_argument('--num_steps', type=int, default=50, help='Number of diffusi
 
 args = parser.parse_args()
 
-# # check cuda
-# if args.gpu != -1 and torch.cuda.is_available():
-#     args.device = f'cuda:{args.gpu}'
-# else:
-#     args.device = 'cpu'
-device = xm.xla_device()
-print("Using device:", device)
+# check cuda
+if args.gpu != -1 and torch.cuda.is_available():
+    args.device = f'cuda:{args.gpu}'
+    print("Menggunakan GPU!")
+else:
+    args.device = 'cpu'
+    print("Menggunakan CPU!")
+
 
 if __name__ == '__main__':
 
     dataname = args.dataname
     split_idx = args.split_idx
-    device = device
+    device = args.device
     hid_dim = args.hid_dim
     mask_type = args.mask
     ratio = args.ratio
@@ -80,7 +102,7 @@ if __name__ == '__main__':
 
         ## M-Step: Density Estimation
      
-        ckpt_dir = f'ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
+        ckpt_dir = f'/kaggle/working/DiffPuterBased/ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/{num_trials}_{num_steps}'
         os.makedirs(f'{ckpt_dir}/{iteration}') if not os.path.exists(f'{ckpt_dir}/{iteration}') else None
 
         print(f'iteration: {iteration}')
@@ -120,6 +142,13 @@ if __name__ == '__main__':
 
         model = Model(denoise_fn = denoise_fn, hid_dim = in_dim).to(device)
 
+                # === TAMBAHAN MULTI-GPU UNTUK TRAINING ===
+        if torch.cuda.device_count() > 1:
+            if iteration == 0: # Print hanya sekali
+                print(f"Menggunakan {torch.cuda.device_count()} GPUs untuk Training!")
+            model = torch.nn.DataParallel(model)
+        # =========================================
+
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=50)
 
@@ -146,9 +175,6 @@ if __name__ == '__main__':
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
-                # CRITICAL FOR TPU:
-                xm.mark_step()
 
             curr_loss = batch_loss/len_input
             scheduler.step(curr_loss)
@@ -156,7 +182,9 @@ if __name__ == '__main__':
             if curr_loss < best_loss:
                 best_loss = curr_loss
                 patience = 0
-                torch.save(model.state_dict(), f'{ckpt_dir}/{iteration}/model.pt')
+                # === MODIFIKASI MULTI-GPU SAVE ===
+                model_to_save = model.module if hasattr(model, 'module') else model
+                torch.save(model_to_save.state_dict(), f'{ckpt_dir}/{iteration}/model.pt')
             else:
                 patience += 1
                 if patience == 500:
@@ -166,7 +194,9 @@ if __name__ == '__main__':
             pbar.set_postfix(loss=curr_loss)
 
             if epoch % 1000 == 0:
-                torch.save(model.state_dict(), f'{ckpt_dir}/{iteration}/model_{epoch}.pt')
+                # === MODIFIKASI MULTI-GPU SAVE ===
+                model_to_save = model.module if hasattr(model, 'module') else model
+                torch.save(model_to_save.state_dict(), f'{ckpt_dir}/{iteration}/model_{epoch}.pt')
 
         end_time = time.time()
 
@@ -192,7 +222,11 @@ if __name__ == '__main__':
             # ==========================================================
 
             net = model.denoise_fn_D
-
+            # === TAMBAHAN MULTI-GPU UNTUK IMPUTASI ===
+            if torch.cuda.device_count() > 1:
+                net = DPWrapper(net)
+            # =========================================
+            
             num_samples, dim = X.shape[0], X.shape[1]
             rec_X = impute_mask(net, impute_X, mask_train, num_samples, dim, num_steps, device)
             
@@ -244,6 +278,11 @@ if __name__ == '__main__':
             # ==========================================================
             net = model.denoise_fn_D
 
+            # === TAMBAHAN MULTI-GPU UNTUK IMPUTASI ===
+            if torch.cuda.device_count() > 1:
+                net = DPWrapper(net)
+            # =========================================
+            
             num_samples, dim = X_test.shape[0], X_test.shape[1]
             rec_X = impute_mask(net, impute_X, mask_test, num_samples, dim, num_steps, device)
             
